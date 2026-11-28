@@ -1,0 +1,67 @@
+diff --git a/distro.go b/distro.go
+new file mode 100644
+index 0000000..7e46546
+--- /dev/null
++++ b/distro.go
+@@ -0,0 +1,61 @@
++package moonlighter
++
++import (
++	"errors"
++	"fmt"
++)
++
++// WSLConf returns the text of the distro's /etc/wsl.conf: systemd on, / made shared at boot,
++// no Windows drives mounted and no Windows program startable.
++func WSLConf() string {
++	return "[boot]\nsystemd=true\ncommand=mount --make-rshared /\n\n" +
++		"[automount]\nenabled=false\n\n" +
++		"[interop]\nenabled=false\nappendWindowsPath=false\n"
++}
++
++// PortReserveUnit returns the systemd unit that waits for flannel to open UDP 8472, then makes
++// one bind() on it. Under WSL mirrored mode the bind fails with EADDRINUSE by design, which
++// makes WSL reserve the port, so that outcome is success. The unit is wanted by, ordered after
++// and part of k3s-agent.service, so it runs on every agent start, restart and boot.
++func PortReserveUnit() string {
++	return `[Unit]
++Description=Reserve UDP 8472 for flannel under WSL mirrored networking
++After=k3s-agent.service
++PartOf=k3s-agent.service
++
++[Service]
++Type=oneshot
++RemainAfterExit=yes
++TimeoutStartSec=300
++ExecStart=/bin/sh -c 'until ss -H -uln "sport = :8472" | grep -q .; do sleep 1; done'
++ExecStart=/usr/bin/python3 -c "import errno, socket, sys\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ntry:\n    s.bind(('0.0.0.0', 8472))\nexcept OSError as e:\n    sys.exit(0 if e.errno == errno.EADDRINUSE else 1)\nsys.exit(1)"
++
++[Install]
++WantedBy=k3s-agent.service
++`
++}
++
++// Size is a CPU count and a memory amount in MiB.
++type Size struct {
++	CPUs   int
++	MemMiB int64
++}
++
++// AgentArgs returns the arguments for `k3s agent`: the server URL and the node address, and
++// system-reserved set to what the distro has beyond the lent size, so the node's allocatable
++// is no more than size. It never returns --flannel-iface: mirrored interface names move.
++func AgentArgs(server, nodeIP string, distro, size Size) ([]string, error) {
++	switch {
++	case server == "":
++		return nil, errors.New("server URL is empty")
++	case nodeIP == "":
++		return nil, errors.New("node address is empty")
++	case size.CPUs <= 0 || size.MemMiB <= 0:
++		return nil, errors.New("size must be above zero")
++	case size.CPUs > distro.CPUs || size.MemMiB > distro.MemMiB:
++		return nil, errors.New("size is larger than the distro")
++	}
++	return []string{"agent", "--server", server, "--node-ip", nodeIP, "--flannel-iface", "eth0",
++		fmt.Sprintf("--kubelet-arg=system-reserved=cpu=%dm,memory=%dMi",
++			(distro.CPUs-size.CPUs)*1000, distro.MemMiB-size.MemMiB)}, nil
++}
